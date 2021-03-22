@@ -29,7 +29,7 @@ serde_json = "1"
 thiserror = "1.0.4"
 tokio = { version = "1.0", features = ["io-util", "fs", "net", "time", "rt"] }
 tokio-util = { version = "0.6.0", features = ["codec"] }
-tokio-native-tls = "0.3.0"
+tokio-native-tls = { git = "https://github.com/pimeys/tls", branch = "vendored-openssl" }
 twox-hash = "1"
 url = "2.1"
 uuid = { version = "0.8.1", features = ["v4"] }
@@ -42,6 +42,7 @@ rand = "0.8.0"
 
 [features]
 nightly = []
+vendored-openssl = ["tokio-native-tls/vendored-openssl", "native-tls/vendored"]
 
 [lib]
 name = "mysql_async"
