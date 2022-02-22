@@ -6,29 +6,34 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+use futures_util::FutureExt;
 pub use mysql_common::named_params;
 
 use mysql_common::{
-    constants::DEFAULT_MAX_ALLOWED_PACKET,
+    constants::{DEFAULT_MAX_ALLOWED_PACKET, UTF8_GENERAL_CI},
     crypto,
+    io::ParseBuf,
     packets::{
-        parse_auth_switch_request, parse_err_packet, parse_handshake_packet, parse_ok_packet,
-        AuthPlugin, AuthSwitchRequest, ErrPacket, HandshakeResponse, OkPacket, OkPacketKind,
-        SslRequest,
+        binlog_request::BinlogRequest, AuthPlugin, AuthSwitchRequest, CommonOkPacket, ErrPacket,
+        HandshakePacket, HandshakeResponse, OkPacket, OkPacketDeserializer, OldAuthSwitchRequest,
+        ResultSetTerminator, SslRequest,
     },
+    proto::MySerialize,
 };
 
 use std::{
     borrow::Cow,
     fmt,
     future::Future,
-    mem,
+    mem::{self, replace},
     pin::Pin,
     str::FromStr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use crate::{
+    buffer_pool::PooledBuf,
     conn::{pool::Pool, stmt_cache::StmtCache},
     consts::{CapabilityFlags, Command, StatusFlags},
     error::*,
@@ -39,11 +44,12 @@ use crate::{
         transaction::TxStatus,
         BinaryProtocol, Queryable, TextProtocol,
     },
-    OptsBuilder,
+    BinlogStream, OptsBuilder,
 };
 
 use self::routines::Routine;
 
+pub mod binlog_stream;
 pub mod pool;
 pub mod routines;
 pub mod stmt_cache;
@@ -73,18 +79,28 @@ fn disconnect(mut conn: Conn) {
     }
 }
 
+/// Pending result set.
+#[derive(Debug, Clone)]
+pub(crate) enum PendingResult {
+    /// There is a pending result set.
+    Pending(ResultSetMeta),
+    /// Result set metadata was taken but not yet consumed.
+    Taken(Arc<ResultSetMeta>),
+}
+
 /// Mysql connection
 struct ConnInner {
     stream: Option<Stream>,
     id: u32,
+    is_mariadb: bool,
     version: (u16, u16, u16),
     socket: Option<String>,
     capabilities: CapabilityFlags,
     status: StatusFlags,
     last_ok_packet: Option<OkPacket<'static>>,
-    last_err_packet: Option<ErrPacket<'static>>,
+    last_err_packet: Option<mysql_common::packets::ServerError<'static>>,
     pool: Option<Pool>,
-    pending_result: Option<ResultSetMeta>,
+    pending_result: std::result::Result<Option<PendingResult>, ServerError>,
     tx_status: TxStatus,
     opts: Opts,
     last_io: Instant,
@@ -94,7 +110,7 @@ struct ConnInner {
     auth_plugin: AuthPlugin<'static>,
     auth_switched: bool,
     /// Connection is already disconnected.
-    disconnected: bool,
+    pub(crate) disconnected: bool,
 }
 
 impl fmt::Debug for ConnInner {
@@ -120,9 +136,10 @@ impl ConnInner {
             last_ok_packet: None,
             last_err_packet: None,
             stream: None,
+            is_mariadb: false,
             version: (0, 0, 0),
             id: 0,
-            pending_result: None,
+            pending_result: Ok(None),
             pool: None,
             tx_status: TxStatus::None,
             last_io: Instant::now(),
@@ -197,6 +214,11 @@ impl Conn {
             .unwrap_or_default()
     }
 
+    /// Returns a reference to the last OK packet.
+    pub fn last_ok_packet(&self) -> Option<&OkPacket<'static>> {
+        self.inner.last_ok_packet.as_ref()
+    }
+
     pub(crate) fn stream_mut(&mut self) -> Result<&mut Stream> {
         self.inner.stream_mut()
     }
@@ -232,10 +254,16 @@ impl Conn {
     }
 
     /// Handles ERR packet.
-    pub(crate) fn handle_err(&mut self, err_packet: ErrPacket<'static>) {
-        self.inner.status = StatusFlags::empty();
-        self.inner.last_ok_packet = None;
-        self.inner.last_err_packet = Some(err_packet);
+    pub(crate) fn handle_err(&mut self, err_packet: ErrPacket<'_>) -> Result<()> {
+        match err_packet {
+            ErrPacket::Error(err) => {
+                self.inner.status = StatusFlags::empty();
+                self.inner.last_ok_packet = None;
+                self.inner.last_err_packet = Some(err.clone().into_owned());
+                Err(Error::from(err))
+            }
+            ErrPacket::Progress(_) => Ok(()),
+        }
     }
 
     /// Returns the current transaction status.
@@ -251,16 +279,63 @@ impl Conn {
     /// Returns pending result metadata, if any.
     ///
     /// If `Some(_)`, then result is not yet consumed.
-    pub(crate) fn get_pending_result(&self) -> Option<&ResultSetMeta> {
-        self.inner.pending_result.as_ref()
+    pub(crate) fn use_pending_result(
+        &mut self,
+    ) -> std::result::Result<Option<&PendingResult>, ServerError> {
+        if let Err(ref e) = self.inner.pending_result {
+            let e = e.clone();
+            self.inner.pending_result = Ok(None);
+            return Err(e);
+        } else {
+            Ok(self.inner.pending_result.as_ref().unwrap().as_ref())
+        }
+    }
+
+    pub(crate) fn get_pending_result(
+        &self,
+    ) -> std::result::Result<Option<&PendingResult>, &ServerError> {
+        self.inner.pending_result.as_ref().map(|x| x.as_ref())
+    }
+
+    pub(crate) fn has_pending_result(&self) -> bool {
+        matches!(self.inner.pending_result, Err(_))
+            || matches!(self.inner.pending_result, Ok(Some(_)))
     }
 
     /// Sets the given pening result metadata for this connection. Returns the previous value.
     pub(crate) fn set_pending_result(
         &mut self,
         meta: Option<ResultSetMeta>,
-    ) -> Option<ResultSetMeta> {
-        std::mem::replace(&mut self.inner.pending_result, meta)
+    ) -> std::result::Result<Option<PendingResult>, ServerError> {
+        replace(
+            &mut self.inner.pending_result,
+            Ok(meta.map(PendingResult::Pending)),
+        )
+    }
+
+    pub(crate) fn set_pending_result_error(
+        &mut self,
+        error: ServerError,
+    ) -> std::result::Result<Option<PendingResult>, ServerError> {
+        replace(&mut self.inner.pending_result, Err(error))
+    }
+
+    /// Gives the currently pending result to a caller for consumption.
+    pub(crate) fn take_pending_result(
+        &mut self,
+    ) -> std::result::Result<Option<Arc<ResultSetMeta>>, ServerError> {
+        let mut output = None;
+
+        self.inner.pending_result = match replace(&mut self.inner.pending_result, Ok(None))? {
+            Some(PendingResult::Pending(x)) => {
+                let meta = Arc::new(x);
+                output = Some(meta.clone());
+                Ok(Some(PendingResult::Taken(meta)))
+            }
+            x => Ok(x),
+        };
+
+        Ok(output)
     }
 
     /// Returns current status flags.
@@ -353,19 +428,33 @@ impl Conn {
 
     async fn handle_handshake(&mut self) -> Result<()> {
         let packet = self.read_packet().await?;
-        let handshake = parse_handshake_packet(&*packet)?;
+        let handshake = ParseBuf(&*packet).parse::<HandshakePacket>(())?;
+
+        // Handshake scramble is always 21 bytes length (20 + zero terminator)
         self.inner.nonce = {
             let mut nonce = Vec::from(handshake.scramble_1_ref());
             nonce.extend_from_slice(handshake.scramble_2_ref().unwrap_or(&[][..]));
+            // Trim zero terminator. Fill with zeroes if nonce
+            // is somehow smaller than 20 bytes (this matches the server behavior).
+            nonce.resize(20, 0);
             nonce
         };
 
         self.inner.capabilities = handshake.capabilities() & self.inner.opts.get_capabilities();
-        self.inner.version = handshake.server_version_parsed().unwrap_or((0, 0, 0));
+        self.inner.version = handshake
+            .maria_db_server_version_parsed()
+            .map(|version| {
+                self.inner.is_mariadb = true;
+                version
+            })
+            .or_else(|| handshake.server_version_parsed())
+            .unwrap_or((0, 0, 0));
         self.inner.id = handshake.connection_id();
         self.inner.status = handshake.status_flags();
         self.inner.auth_plugin = match handshake.auth_plugin() {
-            Some(AuthPlugin::MysqlNativePassword) => AuthPlugin::MysqlNativePassword,
+            Some(AuthPlugin::MysqlNativePassword | AuthPlugin::MysqlOldPassword) => {
+                AuthPlugin::MysqlNativePassword
+            }
             Some(AuthPlugin::CachingSha2Password) => AuthPlugin::CachingSha2Password,
             Some(AuthPlugin::Other(ref name)) => {
                 let name = String::from_utf8_lossy(name).into();
@@ -383,8 +472,12 @@ impl Conn {
             .get_capabilities()
             .contains(CapabilityFlags::CLIENT_SSL)
         {
-            let ssl_request = SslRequest::new(self.inner.capabilities);
-            self.write_packet(ssl_request.as_ref()).await?;
+            let ssl_request = SslRequest::new(
+                self.inner.capabilities,
+                DEFAULT_MAX_ALLOWED_PACKET as u32,
+                UTF8_GENERAL_CI as u8,
+            );
+            self.write_struct(&ssl_request).await?;
             let conn = self;
             let ssl_opts = conn.opts().ssl_opts().cloned().expect("unreachable");
             let domain = conn.opts().ip_or_hostname().into();
@@ -402,16 +495,20 @@ impl Conn {
             .gen_data(self.inner.opts.pass(), &*self.inner.nonce);
 
         let handshake_response = HandshakeResponse::new(
-            &auth_data,
+            auth_data.as_deref(),
             self.inner.version,
-            self.inner.opts.user(),
-            self.inner.opts.db_name(),
-            &self.inner.auth_plugin,
+            self.inner.opts.user().map(|x| x.as_bytes()),
+            self.inner.opts.db_name().map(|x| x.as_bytes()),
+            Some(self.inner.auth_plugin.borrow()),
             self.capabilities(),
-            &Default::default(), // TODO: Add support
+            Default::default(), // TODO: Add support
         );
 
-        self.write_packet(handshake_response.as_ref()).await?;
+        // Serialize here to satisfy borrow checker.
+        let mut buf = crate::BUFFER_POOL.get();
+        handshake_response.serialize(buf.as_mut());
+
+        self.write_packet(buf).await?;
         Ok(())
     }
 
@@ -421,15 +518,32 @@ impl Conn {
     ) -> Result<()> {
         if !self.inner.auth_switched {
             self.inner.auth_switched = true;
-            self.inner.nonce = auth_switch_request.plugin_data().into();
+            self.inner.nonce = auth_switch_request.plugin_data().to_vec();
+
+            if matches!(
+                auth_switch_request.auth_plugin(),
+                AuthPlugin::MysqlOldPassword
+            ) {
+                if self.inner.opts.secure_auth() {
+                    return Err(DriverError::MysqlOldPasswordDisabled.into());
+                }
+            }
+
             self.inner.auth_plugin = auth_switch_request.auth_plugin().clone().into_owned();
+
             let plugin_data = self
                 .inner
                 .auth_plugin
-                .gen_data(self.inner.opts.pass(), &*self.inner.nonce)
-                .unwrap_or_else(Vec::new);
-            self.write_packet(plugin_data).await?;
+                .gen_data(self.inner.opts.pass(), &*self.inner.nonce);
+
+            if let Some(plugin_data) = plugin_data {
+                self.write_struct(&plugin_data).await?;
+            } else {
+                self.write_packet(crate::BUFFER_POOL.get()).await?;
+            }
+
             self.continue_auth().await?;
+
             Ok(())
         } else {
             unreachable!("auth_switched flag should be checked by caller")
@@ -441,7 +555,7 @@ impl Conn {
         // see https://github.com/rust-lang/rust/issues/46415#issuecomment-528099782
         Box::pin(async move {
             match self.inner.auth_plugin {
-                AuthPlugin::MysqlNativePassword => {
+                AuthPlugin::MysqlNativePassword | AuthPlugin::MysqlOldPassword => {
                     self.continue_mysql_native_password_auth().await?;
                     Ok(())
                 }
@@ -484,32 +598,39 @@ impl Conn {
                     self.drop_packet().await
                 }
                 Some(0x04) => {
-                    let mut pass = self.inner.opts.pass().map(Vec::from).unwrap_or_default();
-                    pass.push(0);
+                    let pass = self.inner.opts.pass().unwrap_or_default();
+                    let mut pass = crate::BUFFER_POOL.get_with(pass.as_bytes());
+                    pass.as_mut().push(0);
 
                     if self.is_secure() {
-                        self.write_packet(&*pass).await?;
+                        self.write_packet(pass).await?;
                     } else {
-                        self.write_packet(&[0x02][..]).await?;
+                        self.write_bytes(&[0x02][..]).await?;
                         let packet = self.read_packet().await?;
                         let key = &packet[1..];
-                        for (i, byte) in pass.iter_mut().enumerate() {
+                        for (i, byte) in pass.as_mut().iter_mut().enumerate() {
                             *byte ^= self.inner.nonce[i % self.inner.nonce.len()];
                         }
                         let encrypted_pass = crypto::encrypt(&*pass, key);
-                        self.write_packet(&*encrypted_pass).await?;
+                        self.write_bytes(&*encrypted_pass).await?;
                     };
                     self.drop_packet().await?;
                     Ok(())
                 }
-                _ => Err(DriverError::UnexpectedPacket { payload: packet }.into()),
+                _ => Err(DriverError::UnexpectedPacket {
+                    payload: packet.to_vec(),
+                }
+                .into()),
             },
             Some(0xfe) if !self.inner.auth_switched => {
-                let auth_switch_request = parse_auth_switch_request(&*packet)?.into_owned();
+                let auth_switch_request = ParseBuf(&*packet).parse::<AuthSwitchRequest>(())?;
                 self.perform_auth_switch(auth_switch_request).await?;
                 Ok(())
             }
-            _ => Err(DriverError::UnexpectedPacket { payload: packet }.into()),
+            _ => Err(DriverError::UnexpectedPacket {
+                payload: packet.to_vec(),
+            }
+            .into()),
         }
     }
 
@@ -518,45 +639,70 @@ impl Conn {
         match packet.get(0) {
             Some(0x00) => Ok(()),
             Some(0xfe) if !self.inner.auth_switched => {
-                let auth_switch_request = parse_auth_switch_request(packet.as_ref())?.into_owned();
-                self.perform_auth_switch(auth_switch_request).await?;
-                Ok(())
+                let auth_switch = if packet.len() > 1 {
+                    ParseBuf(&*packet).parse(())?
+                } else {
+                    let _ = ParseBuf(&*packet).parse::<OldAuthSwitchRequest>(())?;
+                    // map OldAuthSwitch to AuthSwitch with mysql_old_password plugin
+                    AuthSwitchRequest::new(
+                        "mysql_old_password".as_bytes(),
+                        self.inner.nonce.clone(),
+                    )
+                };
+                self.perform_auth_switch(auth_switch).await
             }
-            _ => Err(DriverError::UnexpectedPacket { payload: packet }.into()),
+            _ => Err(DriverError::UnexpectedPacket {
+                payload: packet.to_vec(),
+            }
+            .into()),
         }
     }
 
-    fn handle_packet(&mut self, packet: &[u8]) -> Result<()> {
-        let kind = if self.get_pending_result().is_some() {
-            OkPacketKind::ResultSetTerminator
+    /// Returns `true` for ProgressReport packet.
+    fn handle_packet(&mut self, packet: &PooledBuf) -> Result<bool> {
+        let ok_packet = if self.has_pending_result() {
+            ParseBuf(&*packet)
+                .parse::<OkPacketDeserializer<ResultSetTerminator>>(self.capabilities())
+                .map(|x| x.into_inner())
         } else {
-            OkPacketKind::Other
+            ParseBuf(&*packet)
+                .parse::<OkPacketDeserializer<CommonOkPacket>>(self.capabilities())
+                .map(|x| x.into_inner())
         };
 
-        if let Ok(ok_packet) = parse_ok_packet(&*packet, self.capabilities(), kind) {
+        if let Ok(ok_packet) = ok_packet {
             self.handle_ok(ok_packet.into_owned());
-        } else if let Ok(err_packet) = parse_err_packet(&*packet, self.capabilities()) {
-            self.handle_err(err_packet.clone().into_owned());
-            return Err(err_packet.into());
+        } else {
+            let err_packet = ParseBuf(&*packet).parse::<ErrPacket>(self.capabilities());
+            if let Ok(err_packet) = err_packet {
+                self.handle_err(err_packet)?;
+                return Ok(true);
+            }
         }
 
-        Ok(())
+        Ok(false)
     }
 
-    pub(crate) async fn read_packet(&mut self) -> Result<Vec<u8>> {
-        let packet = crate::io::ReadPacket::new(&mut *self)
-            .await
-            .map_err(|io_err| {
-                self.inner.stream.take();
-                self.inner.disconnected = true;
-                Error::from(io_err)
-            })?;
-        self.handle_packet(&*packet)?;
-        Ok(packet)
+    pub(crate) async fn read_packet(&mut self) -> Result<PooledBuf> {
+        loop {
+            let packet = crate::io::ReadPacket::new(&mut *self)
+                .await
+                .map_err(|io_err| {
+                    self.inner.stream.take();
+                    self.inner.disconnected = true;
+                    Error::from(io_err)
+                })?;
+            if self.handle_packet(&packet)? {
+                // ignore progress report
+                continue;
+            } else {
+                return Ok(packet);
+            }
+        }
     }
 
     /// Returns future that reads packets from a server.
-    pub(crate) async fn read_packets(&mut self, n: usize) -> Result<Vec<Vec<u8>>> {
+    pub(crate) async fn read_packets(&mut self, n: usize) -> Result<Vec<PooledBuf>> {
         let mut packets = Vec::with_capacity(n);
         for _ in 0..n {
             packets.push(self.read_packet().await?);
@@ -564,11 +710,8 @@ impl Conn {
         Ok(packets)
     }
 
-    pub(crate) async fn write_packet<T>(&mut self, data: T) -> Result<()>
-    where
-        T: Into<Vec<u8>>,
-    {
-        crate::io::WritePacket::new(&mut *self, data.into())
+    pub(crate) async fn write_packet(&mut self, data: PooledBuf) -> Result<()> {
+        crate::io::WritePacket::new(&mut *self, data)
             .await
             .map_err(|io_err| {
                 self.inner.stream.take();
@@ -577,8 +720,28 @@ impl Conn {
             })
     }
 
+    /// Writes bytes to a server.
+    pub(crate) async fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        let buf = crate::BUFFER_POOL.get_with(bytes);
+        self.write_packet(buf).await
+    }
+
+    /// Sends a serializable structure to a server.
+    pub(crate) async fn write_struct<T: MySerialize>(&mut self, x: &T) -> Result<()> {
+        let mut buf = crate::BUFFER_POOL.get();
+        x.serialize(buf.as_mut());
+        self.write_packet(buf).await
+    }
+
+    /// Sends a command to a server.
+    pub(crate) async fn write_command<T: MySerialize>(&mut self, cmd: &T) -> Result<()> {
+        self.clean_dirty().await?;
+        self.reset_seq_id();
+        self.write_struct(cmd).await
+    }
+
     /// Returns future that sends full command body to a server.
-    pub(crate) async fn write_command_raw(&mut self, body: Vec<u8>) -> Result<()> {
+    pub(crate) async fn write_command_raw(&mut self, body: PooledBuf) -> Result<()> {
         debug_assert!(!body.is_empty());
         self.clean_dirty().await?;
         self.reset_seq_id();
@@ -591,10 +754,11 @@ impl Conn {
         T: AsRef<[u8]>,
     {
         let cmd_data = cmd_data.as_ref();
-        let mut body = Vec::with_capacity(1 + cmd_data.len());
+        let mut buf = crate::BUFFER_POOL.get();
+        let body = buf.as_mut();
         body.push(cmd as u8);
         body.extend_from_slice(cmd_data);
-        self.write_command_raw(body).await
+        self.write_command_raw(buf).await
     }
 
     async fn drop_packet(&mut self) -> Result<()> {
@@ -615,7 +779,7 @@ impl Conn {
     /// Returns a future that resolves to [`Conn`].
     pub fn new<T: Into<Opts>>(opts: T) -> crate::BoxFuture<'static, Conn> {
         let opts = opts.into();
-        let fut = Box::pin(async move {
+        async move {
             let mut conn = Conn::empty(opts.clone());
 
             let stream = if let Some(_path) = opts.socket() {
@@ -646,8 +810,8 @@ impl Conn {
             conn.run_init_commands().await?;
 
             Ok(conn)
-        });
-        crate::BoxFuture(fut)
+        }
+        .boxed()
     }
 
     /// Returns a future that resolves to [`Conn`].
@@ -686,18 +850,25 @@ impl Conn {
 
     /// Reads and stores `max_allowed_packet` in the connection.
     async fn read_max_allowed_packet(&mut self) -> Result<()> {
-        let row_opt = self.query_first("SELECT @@max_allowed_packet").await?;
+        let max_allowed_packet = if let Some(value) = self.opts().max_allowed_packet() {
+            Some(value)
+        } else {
+            self.query_first("SELECT @@max_allowed_packet").await?
+        };
         if let Some(stream) = self.inner.stream.as_mut() {
-            stream.set_max_allowed_packet(row_opt.unwrap_or((DEFAULT_MAX_ALLOWED_PACKET,)).0);
+            stream.set_max_allowed_packet(max_allowed_packet.unwrap_or(DEFAULT_MAX_ALLOWED_PACKET));
         }
         Ok(())
     }
 
     /// Reads and stores `wait_timeout` in the connection.
     async fn read_wait_timeout(&mut self) -> Result<()> {
-        let row_opt = self.query_first("SELECT @@wait_timeout").await?;
-        let wait_timeout_secs = row_opt.unwrap_or((28800,)).0;
-        self.inner.wait_timeout = Duration::from_secs(wait_timeout_secs);
+        let wait_timeout = if let Some(value) = self.opts().wait_timeout() {
+            Some(value)
+        } else {
+            self.query_first("SELECT @@wait_timeout").await?
+        };
+        self.inner.wait_timeout = Duration::from_secs(wait_timeout.unwrap_or(28800) as u64);
         Ok(())
     }
 
@@ -709,7 +880,7 @@ impl Conn {
             .opts
             .conn_ttl()
             .unwrap_or(self.inner.wait_timeout);
-        self.idling() > ttl
+        !ttl.is_zero() && self.idling() > ttl
     }
 
     /// Returns duration since last IO.
@@ -723,7 +894,14 @@ impl Conn {
     pub async fn reset(&mut self) -> Result<()> {
         let pool = self.inner.pool.clone();
 
-        if self.inner.version > (5, 7, 2) {
+        let supports_com_reset_connection = if self.inner.is_mariadb {
+            self.inner.version >= (10, 2, 4)
+        } else {
+            // assuming mysql
+            self.inner.version > (5, 7, 2)
+        };
+
+        if supports_com_reset_connection {
             self.routine(routines::ResetRoutine).await?;
         } else {
             let opts = self.inner.opts.clone();
@@ -753,23 +931,37 @@ impl Conn {
 
     /// The purpose of this function is to cleanup a pending result set
     /// for prematurely dropeed connection or query result.
+    ///
+    /// Requires that there are no other references to the pending result.
     pub(crate) async fn drop_result(&mut self) -> Result<()> {
-        match self.inner.pending_result {
-            Some(ResultSetMeta::Text(_)) => {
+        // Map everything into `PendingResult::Pending`
+        let meta = match self.set_pending_result(None)? {
+            Some(PendingResult::Pending(meta)) => Some(meta),
+            Some(PendingResult::Taken(meta)) => {
+                // This also asserts that there is only one reference left to the taken ResultSetMeta,
+                // therefore this result set must be dropped here since it won't be dropped anywhere else.
+                Some(Arc::try_unwrap(meta).expect("Conn::drop_result call on a pending result that may still be droped by someone else"))
+            }
+            None => None,
+        };
+
+        let _ = self.set_pending_result(meta);
+
+        match self.use_pending_result() {
+            Ok(Some(PendingResult::Pending(ResultSetMeta::Text(_)))) => {
                 QueryResult::<'_, '_, TextProtocol>::new(self)
                     .drop_result()
                     .await
             }
-            Some(ResultSetMeta::Binary(_)) => {
+            Ok(Some(PendingResult::Pending(ResultSetMeta::Binary(_)))) => {
                 QueryResult::<'_, '_, BinaryProtocol>::new(self)
                     .drop_result()
                     .await
             }
-            Some(ResultSetMeta::Error(_)) => match self.set_pending_result(None) {
-                Some(ResultSetMeta::Error(err)) => Err(err.into()),
-                _ => unreachable!(),
-            },
-            None => Ok(()),
+            Ok(None) => Ok((/* this case does not require an action */)),
+            Ok(Some(PendingResult::Taken(_))) | Err(_) => {
+                unreachable!("this case must be handled earlier in this function")
+            }
         }
     }
 
@@ -778,7 +970,7 @@ impl Conn {
     /// The purpose of this function, is to cleanup the connection while returning it to a [`Pool`].
     async fn cleanup_for_pool(mut self) -> Result<Self> {
         loop {
-            let result = if self.inner.pending_result.is_some() {
+            let result = if self.has_pending_result() {
                 self.drop_result().await
             } else if self.inner.tx_status != TxStatus::None {
                 self.rollback_transaction().await
@@ -799,14 +991,183 @@ impl Conn {
         }
         Ok(self)
     }
+
+    async fn register_as_slave(&mut self, server_id: u32) -> Result<()> {
+        use mysql_common::packets::ComRegisterSlave;
+
+        self.query_drop("SET @master_binlog_checksum='ALL'").await?;
+        self.write_command(&ComRegisterSlave::new(server_id))
+            .await?;
+
+        // Server will respond with OK.
+        self.read_packet().await?;
+
+        Ok(())
+    }
+
+    async fn request_binlog(&mut self, request: BinlogRequest<'_>) -> Result<()> {
+        self.register_as_slave(request.server_id()).await?;
+        self.write_command(&request.as_cmd()).await?;
+        Ok(())
+    }
+
+    pub async fn get_binlog_stream(mut self, request: BinlogRequest<'_>) -> Result<BinlogStream> {
+        // We'll disconnect this connection from a pool before requesting the binlog.
+        self.inner.pool = None;
+        self.request_binlog(request).await?;
+
+        Ok(BinlogStream::new(self))
+    }
 }
 
 #[cfg(test)]
 mod test {
+    use futures_util::stream::StreamExt;
+    use mysql_common::binlog::events::EventData;
+    use tokio::time::timeout;
+
+    use std::time::Duration;
+
     use crate::{
-        from_row, params, prelude::*, test_misc::get_opts, Conn, Error, OptsBuilder, Pool, TxOpts,
-        WhiteListFsLocalInfileHandler,
+        from_row, params, prelude::*, test_misc::get_opts, BinlogDumpFlags, BinlogRequest, Conn,
+        Error, OptsBuilder, Pool, WhiteListFsLocalInfileHandler,
     };
+
+    async fn gen_dummy_data() -> super::Result<()> {
+        let mut conn = Conn::new(get_opts()).await?;
+
+        "CREATE TABLE IF NOT EXISTS customers (customer_id int not null)"
+            .ignore(&mut conn)
+            .await?;
+
+        for i in 0_u8..100 {
+            "INSERT INTO customers(customer_id) VALUES (?)"
+                .with((i,))
+                .ignore(&mut conn)
+                .await?;
+        }
+
+        "DROP TABLE customers".ignore(&mut conn).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn should_read_binlog() -> super::Result<()> {
+        async fn get_conn() -> super::Result<(Conn, Vec<u8>, u64)> {
+            let mut conn = Conn::new(get_opts()).await?;
+
+            if let Ok(Some(gtid_mode)) = "SELECT @@GLOBAL.GTID_MODE"
+                .first::<String, _>(&mut conn)
+                .await
+            {
+                if !gtid_mode.starts_with("ON") {
+                    panic!(
+                        "GTID_MODE is disabled \
+                            (enable using --gtid_mode=ON --enforce_gtid_consistency=ON)"
+                    );
+                }
+            }
+
+            let row: crate::Row = "SHOW BINARY LOGS".first(&mut conn).await?.unwrap();
+            let filename = row.get(0).unwrap();
+            let position = row.get(1).unwrap();
+
+            gen_dummy_data().await.unwrap();
+            Ok((conn, filename, position))
+        }
+
+        // iterate using COM_BINLOG_DUMP
+        let (conn, filename, pos) = get_conn().await.unwrap();
+        let is_mariadb = conn.inner.is_mariadb;
+
+        let mut binlog_stream = conn
+            .get_binlog_stream(BinlogRequest::new(12).with_filename(filename).with_pos(pos))
+            .await
+            .unwrap();
+
+        let mut events_num = 0;
+        while let Ok(Some(event)) = timeout(Duration::from_secs(1), binlog_stream.next()).await {
+            let event = event.unwrap();
+            events_num += 1;
+
+            // assert that event type is known
+            event.header().event_type().unwrap();
+
+            // iterate over rows of an event
+            match event.read_data()?.unwrap() {
+                EventData::RowsEvent(re) => {
+                    let tme = binlog_stream.get_tme(re.table_id());
+                    for row in re.rows(tme.unwrap()) {
+                        row.unwrap();
+                    }
+                }
+                _ => (),
+            }
+        }
+        assert!(events_num > 0);
+
+        if !is_mariadb {
+            // iterate using COM_BINLOG_DUMP_GTID
+            let (conn, filename, pos) = get_conn().await.unwrap();
+
+            let mut binlog_stream = conn
+                .get_binlog_stream(
+                    BinlogRequest::new(13)
+                        .with_use_gtid(true)
+                        .with_filename(filename)
+                        .with_pos(pos),
+                )
+                .await
+                .unwrap();
+
+            events_num = 0;
+            while let Ok(Some(event)) = timeout(Duration::from_secs(1), binlog_stream.next()).await
+            {
+                let event = event.unwrap();
+                events_num += 1;
+
+                // assert that event type is known
+                event.header().event_type().unwrap();
+
+                // iterate over rows of an event
+                match event.read_data()?.unwrap() {
+                    EventData::RowsEvent(re) => {
+                        let tme = binlog_stream.get_tme(re.table_id());
+                        for row in re.rows(tme.unwrap()) {
+                            row.unwrap();
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            assert!(events_num > 0);
+        }
+
+        // iterate using COM_BINLOG_DUMP with BINLOG_DUMP_NON_BLOCK flag
+        let (conn, filename, pos) = get_conn().await.unwrap();
+
+        let mut binlog_stream = conn
+            .get_binlog_stream(
+                BinlogRequest::new(14)
+                    .with_filename(filename)
+                    .with_pos(pos)
+                    .with_flags(BinlogDumpFlags::BINLOG_DUMP_NON_BLOCK),
+            )
+            .await
+            .unwrap();
+
+        events_num = 0;
+        while let Some(event) = binlog_stream.next().await {
+            let event = event.unwrap();
+            events_num += 1;
+            event.header().event_type().unwrap();
+            event.read_data()?;
+        }
+        assert!(events_num > 0);
+
+        Ok(())
+    }
 
     #[test]
     fn opts_should_satisfy_send_and_sync() {
@@ -1030,212 +1391,6 @@ mod test {
         let result: Option<u8> = conn.query_first("SELECT COUNT(*) FROM tmp").await?;
         conn.disconnect().await?;
         assert_eq!(result, Some(1_u8));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn dropped_query_result_should_emit_errors_on_cleanup() -> super::Result<()> {
-        use crate::{Error::Server, ServerError};
-        let mut conn = Conn::new(get_opts()).await?;
-        conn.query_iter("SELECT '1'; BLABLA;").await?;
-        assert!(matches!(
-            conn.query_drop("DO 42;").await.unwrap_err(),
-            Server(ServerError { code: 1064, .. })
-        ));
-        conn.disconnect().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn should_try_collect() -> super::Result<()> {
-        let mut conn = Conn::new(get_opts()).await?;
-        let mut result = conn
-            .query_iter(
-                r"SELECT 'hello', 123
-                    UNION ALL
-                    SELECT 'world', 'bar'
-                    UNION ALL
-                    SELECT 'hello', 123
-                ",
-            )
-            .await?;
-        let mut rows = result.try_collect::<(String, u8)>().await?;
-        assert!(rows.pop().unwrap().is_ok());
-        assert!(rows.pop().unwrap().is_err());
-        assert!(rows.pop().unwrap().is_ok());
-        result.drop_result().await?;
-        conn.disconnect().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn should_try_collect_and_drop() -> super::Result<()> {
-        let mut conn = Conn::new(get_opts()).await?;
-        let mut rows = conn
-            .query_iter(
-                r"SELECT 'hello', 123
-                    UNION ALL
-                    SELECT 'world', 'bar'
-                    UNION ALL
-                    SELECT 'hello', 123;
-                    SELECT 'foo', 255;
-                ",
-            )
-            .await?
-            .try_collect_and_drop::<(String, u8)>()
-            .await?;
-        assert!(rows.pop().unwrap().is_ok());
-        assert!(rows.pop().unwrap().is_err());
-        assert!(rows.pop().unwrap().is_ok());
-        conn.disconnect().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn should_handle_mutliresult_set() -> super::Result<()> {
-        let mut conn = Conn::new(get_opts()).await?;
-        let mut result = conn
-            .query_iter(
-                r"SELECT 'hello', 123
-                    UNION ALL
-                    SELECT 'world', 231;
-                    SELECT 'foo', 255;
-                ",
-            )
-            .await?;
-        let rows_1 = result.collect::<(String, u8)>().await?;
-        let rows_2 = result.collect_and_drop().await?;
-        conn.disconnect().await?;
-
-        assert_eq!((String::from("hello"), 123), rows_1[0]);
-        assert_eq!((String::from("world"), 231), rows_1[1]);
-        assert_eq!((String::from("foo"), 255), rows_2[0]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn should_map_resultset() -> super::Result<()> {
-        let mut conn = Conn::new(get_opts()).await?;
-        let mut result = conn
-            .query_iter(
-                r"
-                    SELECT 'hello', 123
-                    UNION ALL
-                    SELECT 'world', 231;
-                    SELECT 'foo', 255;
-                ",
-            )
-            .await?;
-
-        let rows_1 = result.map(|row| from_row::<(String, u8)>(row)).await?;
-        let rows_2 = result.map_and_drop(from_row).await?;
-        conn.disconnect().await?;
-
-        assert_eq!((String::from("hello"), 123), rows_1[0]);
-        assert_eq!((String::from("world"), 231), rows_1[1]);
-        assert_eq!((String::from("foo"), 255), rows_2[0]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn should_reduce_resultset() -> super::Result<()> {
-        let mut conn = Conn::new(get_opts()).await?;
-        let mut result = conn
-            .query_iter(
-                r"SELECT 5
-                    UNION ALL
-                    SELECT 6;
-                    SELECT 7;",
-            )
-            .await?;
-        let reduced = result
-            .reduce(0, |mut acc, row| {
-                acc += from_row::<i32>(row);
-                acc
-            })
-            .await?;
-        let rows_2 = result.collect_and_drop::<i32>().await?;
-        conn.disconnect().await?;
-        assert_eq!(11, reduced);
-        assert_eq!(7, rows_2[0]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn should_handle_multi_result_sets_where_some_results_have_no_output() -> super::Result<()>
-    {
-        const QUERY: &str = r"SELECT 1;
-            UPDATE time_zone SET Time_zone_id = 1 WHERE Time_zone_id = 1;
-            SELECT 2;
-            SELECT 3;
-            UPDATE time_zone SET Time_zone_id = 1 WHERE Time_zone_id = 1;
-            UPDATE time_zone SET Time_zone_id = 1 WHERE Time_zone_id = 1;
-            SELECT 4;";
-
-        let mut c = Conn::new(get_opts()).await?;
-        c.query_drop("CREATE TEMPORARY TABLE time_zone (Time_zone_id INT)")
-            .await
-            .unwrap();
-        let mut t = c.start_transaction(TxOpts::new()).await?;
-        t.query_drop(QUERY).await?;
-        let r = t.query_iter(QUERY).await?;
-        let out = r.collect_and_drop::<u8>().await?;
-        assert_eq!(vec![1], out);
-        let r = t.query_iter(QUERY).await?;
-        r.for_each_and_drop(|x| assert_eq!(from_row::<u8>(x), 1))
-            .await?;
-        let r = t.query_iter(QUERY).await?;
-        let out = r.map_and_drop(|row| from_row::<u8>(row)).await?;
-        assert_eq!(vec![1], out);
-        let r = t.query_iter(QUERY).await?;
-        let out = r
-            .reduce_and_drop(0u8, |acc, x| acc + from_row::<u8>(x))
-            .await?;
-        assert_eq!(1, out);
-        t.query_drop(QUERY).await?;
-        t.commit().await?;
-        let result = c.exec_first("SELECT 1", ()).await?;
-        c.disconnect().await?;
-        assert_eq!(result, Some(1_u8));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn should_iterate_over_resultset() -> super::Result<()> {
-        use std::sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        };
-
-        let acc = Arc::new(AtomicUsize::new(0));
-
-        let mut conn = Conn::new(get_opts()).await?;
-        let mut result = conn
-            .query_iter(
-                r"SELECT 2
-                    UNION ALL
-                    SELECT 3;
-                    SELECT 5;",
-            )
-            .await?;
-        result
-            .for_each({
-                let acc = acc.clone();
-                move |row| {
-                    acc.fetch_add(from_row::<usize>(row), Ordering::SeqCst);
-                }
-            })
-            .await?;
-        result
-            .for_each_and_drop({
-                let acc = acc.clone();
-                move |row| {
-                    acc.fetch_add(from_row::<usize>(row), Ordering::SeqCst);
-                }
-            })
-            .await?;
-        conn.disconnect().await?;
-        assert_eq!(acc.load(Ordering::SeqCst), 10);
         Ok(())
     }
 

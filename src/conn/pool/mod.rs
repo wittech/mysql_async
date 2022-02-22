@@ -6,10 +6,12 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+use futures_util::FutureExt;
 use tokio::sync::mpsc;
 
 use std::{
     collections::VecDeque,
+    convert::TryFrom,
     pin::Pin,
     str::FromStr,
     sync::{atomic, Arc, Mutex},
@@ -22,7 +24,6 @@ use crate::{
     error::*,
     opts::{Opts, PoolOpts},
     queryable::transaction::{Transaction, TxOpts, TxStatus},
-    BoxFuture,
 };
 
 mod recycler;
@@ -111,8 +112,16 @@ pub struct Pool {
 
 impl Pool {
     /// Creates a new pool of connections.
-    pub fn new<O: Into<Opts>>(opts: O) -> Pool {
-        let opts = opts.into();
+    ///
+    /// # Panic
+    ///
+    /// It'll panic if `Opts::try_from(opts)` returns error.
+    pub fn new<O>(opts: O) -> Pool
+    where
+        Opts: TryFrom<O>,
+        <Opts as TryFrom<O>>::Error: std::error::Error,
+    {
+        let opts = Opts::try_from(opts).unwrap();
         let pool_opts = opts.pool_opts().clone();
         let (tx, rx) = mpsc::unbounded_channel();
         Pool {
@@ -175,7 +184,7 @@ impl Pool {
             && !conn.inner.disconnected
             && !conn.expired()
             && conn.inner.tx_status == TxStatus::None
-            && conn.inner.pending_result.is_none()
+            && !conn.has_pending_result()
             && !self.inner.close.load(atomic::Ordering::Acquire)
         {
             let mut exchange = self.inner.exchange.lock().unwrap();
@@ -242,10 +251,13 @@ impl Pool {
             if !conn.expired() {
                 return Poll::Ready(Ok(GetConn {
                     pool: Some(self.clone()),
-                    inner: GetConnInner::Checking(BoxFuture(Box::pin(async move {
-                        conn.stream_mut()?.check().await?;
-                        Ok(conn)
-                    }))),
+                    inner: GetConnInner::Checking(
+                        async move {
+                            conn.stream_mut()?.check().await?;
+                            Ok(conn)
+                        }
+                        .boxed(),
+                    ),
                 }));
             } else {
                 self.send_to_recycler(conn);
@@ -260,7 +272,7 @@ impl Pool {
 
             return Poll::Ready(Ok(GetConn {
                 pool: Some(self.clone()),
-                inner: GetConnInner::Connecting(BoxFuture(Box::pin(Conn::new(self.opts.clone())))),
+                inner: GetConnInner::Connecting(Conn::new(self.opts.clone()).boxed()),
             }));
         }
 
@@ -273,6 +285,11 @@ impl Pool {
 impl Drop for Conn {
     fn drop(&mut self) {
         if std::thread::panicking() {
+            // Try to decrease the number of existing connections.
+            if let Some(pool) = self.inner.pool.take() {
+                pool.cancel_connection();
+            }
+
             return;
         }
 
@@ -358,11 +375,12 @@ mod test {
 
             // create some conns..
             let connections = (0..NUM_CONNS).map(|_| {
-                crate::BoxFuture(Box::pin(async {
+                async {
                     let mut conn = pool.get_conn().await?;
                     conn.ping().await?;
-                    Ok(conn)
-                }))
+                    crate::Result::Ok(conn)
+                }
+                .boxed()
             });
 
             // collect ids..
@@ -402,6 +420,27 @@ mod test {
         test(&mut master, get_opts().prefer_socket(false)).await?;
 
         master.disconnect().await
+    }
+
+    #[tokio::test]
+    async fn should_reuse_connections() -> super::Result<()> {
+        let constraints = PoolConstraints::new(1, 1).unwrap();
+        let opts = get_opts().pool_opts(PoolOpts::default().with_constraints(constraints));
+
+        let pool = Pool::new(opts);
+        let mut conn = pool.get_conn().await?;
+
+        let server_version = conn.server_version();
+        let connection_id = conn.id();
+
+        for _ in 0..16 {
+            drop(conn);
+            conn = pool.get_conn().await?;
+            println!("CONN connection_id={}", conn.id());
+            assert!(conn.id() == connection_id || server_version < (5, 7, 2));
+        }
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -573,7 +612,7 @@ mod test {
     #[tokio::test]
     async fn should_hold_bounds_on_error() -> super::Result<()> {
         // Should not be possible to connect to broadcast address.
-        let pool = Pool::new(String::from("mysql://255.255.255.255"));
+        let pool = Pool::new("mysql://255.255.255.255");
 
         assert!(try_join!(pool.get_conn(), pool.get_conn()).is_err());
         assert_eq!(ex_field!(pool, exist), 0);
@@ -645,13 +684,13 @@ mod test {
                 .block_on(async {
                     let pool = Pool::new(get_opts());
                     let _conn = pool.get_conn().await.unwrap();
-                    panic!(PANIC_MESSAGE);
+                    std::panic::panic_any(PANIC_MESSAGE);
                 });
         });
 
         assert_eq!(
             *result.unwrap_err().downcast::<&str>().unwrap(),
-            PANIC_MESSAGE,
+            "ORIGINAL_PANIC",
         );
     }
 

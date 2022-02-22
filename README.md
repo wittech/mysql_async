@@ -1,6 +1,6 @@
 ## mysql-async
 
-Tokio based asynchronous MySql client library for rust programming language.
+Tokio based asynchronous MySql client library for The Rust Programming Language.
 
 [![Gitter](https://badges.gitter.im/rust-mysql/community.svg)](https://gitter.im/rust-mysql/community?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
 
@@ -11,7 +11,7 @@ Tokio based asynchronous MySql client library for rust programming language.
 
 ### Installation
 
-Library hosted on [crates.io](https://crates.io/crates/mysql_async/).
+The library is hosted on [crates.io](https://crates.io/crates/mysql_async/).
 ```toml
 [dependencies]
 mysql_async = "<desired version>"
@@ -19,7 +19,7 @@ mysql_async = "<desired version>"
 
 ### Example
 
-See crate documentation on [docs.rs](https://docs.rs/mysql_async).
+Please see the crate docs – [docs.rs](https://docs.rs/mysql_async).
 
 ### License
 

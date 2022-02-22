@@ -10,11 +10,10 @@ pub use self::{read_packet::ReadPacket, write_packet::WritePacket};
 
 use bytes::BytesMut;
 use futures_core::{ready, stream};
-use futures_util::stream::{FuturesUnordered, StreamExt};
-use mio::net::{TcpKeepalive, TcpSocket};
 use mysql_common::proto::codec::PacketCodec as PacketCodecInner;
 use native_tls::{Certificate, Identity, TlsConnector};
 use pin_project::pin_project;
+use socket2::{Socket as Socket2Socket, TcpKeepalive};
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 use tokio::{
@@ -34,14 +33,18 @@ use std::{
         ErrorKind::{BrokenPipe, NotConnected, Other},
         Read,
     },
-    net::{SocketAddr, ToSocketAddrs},
+    mem::replace,
     ops::{Deref, DerefMut},
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
 
-use crate::{error::IoError, opts::SslOpts};
+use crate::{
+    buffer_pool::PooledBuf,
+    error::IoError,
+    opts::{HostPortOrUrl, SslOpts, DEFAULT_PORT},
+};
 
 #[cfg(unix)]
 use crate::io::socket::Socket;
@@ -61,37 +64,54 @@ mod read_packet;
 mod socket;
 mod write_packet;
 
-#[derive(Debug, Default)]
-pub struct PacketCodec(PacketCodecInner);
+#[derive(Debug)]
+pub struct PacketCodec {
+    inner: PacketCodecInner,
+    decode_buf: PooledBuf,
+}
+
+impl Default for PacketCodec {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            decode_buf: crate::BUFFER_POOL.get(),
+        }
+    }
+}
 
 impl Deref for PacketCodec {
     type Target = PacketCodecInner;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for PacketCodec {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.inner
     }
 }
 
 impl Decoder for PacketCodec {
-    type Item = Vec<u8>;
+    type Item = PooledBuf;
     type Error = IoError;
 
     fn decode(&mut self, src: &mut BytesMut) -> std::result::Result<Option<Self::Item>, IoError> {
-        Ok(self.0.decode(src)?)
+        if self.inner.decode(src, self.decode_buf.as_mut())? {
+            let new_buf = crate::BUFFER_POOL.get();
+            Ok(Some(replace(&mut self.decode_buf, new_buf)))
+        } else {
+            Ok(None)
+        }
     }
 }
 
-impl Encoder<Vec<u8>> for PacketCodec {
+impl Encoder<PooledBuf> for PacketCodec {
     type Error = IoError;
 
-    fn encode(&mut self, item: Vec<u8>, dst: &mut BytesMut) -> std::result::Result<(), IoError> {
-        Ok(self.0.encode(item, dst)?)
+    fn encode(&mut self, item: PooledBuf, dst: &mut BytesMut) -> std::result::Result<(), IoError> {
+        Ok(self.inner.encode(&mut item.as_ref(), dst)?)
     }
 }
 
@@ -190,6 +210,7 @@ impl Endpoint {
                 .map(|x| vec![x])
                 .or_else(|_| {
                     pem::parse_many(&*root_cert_data)
+                        .unwrap_or_default()
                         .iter()
                         .map(pem::encode)
                         .map(|s| Certificate::from_pem(s.as_bytes()))
@@ -336,108 +357,41 @@ impl Stream {
         }
     }
 
-    pub(crate) async fn connect_tcp<S>(addr: S, keepalive: Option<Duration>) -> io::Result<Stream>
-    where
-        S: ToSocketAddrs,
-    {
-        // TODO: Use tokio to setup keepalive (see tokio-rs/tokio#3082)
-        async fn connect_stream(
-            addr: SocketAddr,
-            keepalive_opts: Option<TcpKeepalive>,
-        ) -> io::Result<TcpStream> {
-            let socket = if addr.is_ipv6() {
-                TcpSocket::new_v6()?
-            } else {
-                TcpSocket::new_v4()?
-            };
-
-            if let Some(keepalive_opts) = keepalive_opts {
-                socket.set_keepalive_params(keepalive_opts)?;
+    pub(crate) async fn connect_tcp(
+        addr: &HostPortOrUrl,
+        keepalive: Option<Duration>,
+    ) -> io::Result<Stream> {
+        let tcp_stream = match addr {
+            HostPortOrUrl::HostPort(host, port) => {
+                TcpStream::connect((host.as_str(), *port)).await?
             }
+            HostPortOrUrl::Url(url) => {
+                let addrs = url.socket_addrs(|| Some(DEFAULT_PORT))?;
+                TcpStream::connect(&*addrs).await?
+            }
+        };
 
-            let stream = tokio::task::spawn_blocking(move || {
-                let mut stream = socket.connect(addr)?;
-                let mut poll = mio::Poll::new()?;
-                let mut events = mio::Events::with_capacity(1024);
-
-                poll.registry()
-                    .register(&mut stream, mio::Token(0), mio::Interest::WRITABLE)?;
-
-                loop {
-                    poll.poll(&mut events, None)?;
-
-                    for event in &events {
-                        if event.token() == mio::Token(0) && event.is_error() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::ConnectionRefused,
-                                "Connection refused",
-                            ));
-                        }
-
-                        if event.token() == mio::Token(0) && event.is_writable() {
-                            // The socket connected (probably, it could still be a spurious
-                            // wakeup)
-                            return Ok::<_, io::Error>(stream);
-                        }
-                    }
-                }
-            })
-            .await??;
-
+        if let Some(duration) = keepalive {
             #[cfg(unix)]
-            let std_stream = unsafe {
+            let socket = unsafe {
                 use std::os::unix::prelude::*;
-                let fd = stream.into_raw_fd();
-                std::net::TcpStream::from_raw_fd(fd)
+                let fd = tcp_stream.as_raw_fd();
+                Socket2Socket::from_raw_fd(fd)
             };
-
             #[cfg(windows)]
-            let std_stream = unsafe {
+            let socket = unsafe {
                 use std::os::windows::prelude::*;
-                let fd = stream.into_raw_socket();
-                std::net::TcpStream::from_raw_socket(fd)
+                let sock = tcp_stream.as_raw_socket();
+                Socket2Socket::from_raw_socket(sock)
             };
-
-            Ok(TcpStream::from_std(std_stream)?)
+            socket.set_tcp_keepalive(&TcpKeepalive::new().with_time(duration))?;
+            std::mem::forget(socket);
         }
 
-        let keepalive_opts = keepalive.map(|time| TcpKeepalive::new().with_time(time));
-
-        match addr.to_socket_addrs() {
-            Ok(addresses) => {
-                let mut streams = FuturesUnordered::new();
-
-                for address in addresses {
-                    streams.push(connect_stream(address, keepalive_opts.clone()));
-                }
-
-                let mut err = None;
-                while let Some(stream) = streams.next().await {
-                    match stream {
-                        Err(e) => {
-                            err = Some(e);
-                        }
-                        Ok(stream) => {
-                            return Ok(Stream {
-                                closed: false,
-                                codec: Box::new(Framed::new(stream.into(), PacketCodec::default()))
-                                    .into(),
-                            });
-                        }
-                    }
-                }
-
-                if let Some(e) = err {
-                    Err(e)
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "could not resolve to any address",
-                    ))
-                }
-            }
-            Err(err) => Err(err),
-        }
+        Ok(Stream {
+            closed: false,
+            codec: Box::new(Framed::new(tcp_stream.into(), PacketCodec::default())).into(),
+        })
     }
 
     #[cfg(unix)]
@@ -515,7 +469,7 @@ impl Stream {
 }
 
 impl stream::Stream for Stream {
-    type Item = std::result::Result<Vec<u8>, IoError>;
+    type Item = std::result::Result<PooledBuf, IoError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if !self.closed {
@@ -552,8 +506,8 @@ mod test {
         };
 
         assert_eq!(
-            sock.keepalive().unwrap(),
-            Some(std::time::Duration::from_millis(42_000)),
+            sock.keepalive_time().unwrap(),
+            std::time::Duration::from_millis(42_000),
         );
 
         std::mem::forget(sock);

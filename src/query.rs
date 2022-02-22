@@ -6,11 +6,13 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+use futures_util::FutureExt;
+
 use crate::{
     connection_like::ToConnectionResult,
     from_row,
     prelude::{FromRow, StatementLike, ToConnection},
-    BinaryProtocol, BoxFuture, Params, QueryResult, TextProtocol,
+    BinaryProtocol, BoxFuture, Params, QueryResult, ResultSetStream, TextProtocol,
 };
 
 /// MySql text query.
@@ -58,7 +60,7 @@ pub trait Query: Send + Sized {
         C: ToConnection<'a, 't> + 'a,
         T: FromRow + Send + 'static,
     {
-        BoxFuture(Box::pin(async move {
+        async move {
             let mut result = self.run(conn).await?;
             let output = if result.is_empty() {
                 None
@@ -67,7 +69,8 @@ pub trait Query: Send + Sized {
             };
             result.drop_result().await?;
             Ok(output)
-        }))
+        }
+        .boxed()
     }
 
     /// This methods corresponds to [`Queryable::query`][query].
@@ -79,9 +82,7 @@ pub trait Query: Send + Sized {
         C: ToConnection<'a, 't> + 'a,
         T: FromRow + Send + 'static,
     {
-        BoxFuture(Box::pin(async move {
-            self.run(conn).await?.collect_and_drop::<T>().await
-        }))
+        async move { self.run(conn).await?.collect_and_drop::<T>().await }.boxed()
     }
 
     /// This methods corresponds to [`Queryable::query_fold`][query_fold].
@@ -95,9 +96,7 @@ pub trait Query: Send + Sized {
         T: FromRow + Send + 'static,
         U: Send + 'a,
     {
-        BoxFuture(Box::pin(async move {
-            self.run(conn).await?.reduce_and_drop(init, next).await
-        }))
+        async move { self.run(conn).await?.reduce_and_drop(init, next).await }.boxed()
     }
 
     /// This methods corresponds to [`Queryable::query_map`][query_map].
@@ -111,12 +110,39 @@ pub trait Query: Send + Sized {
         T: FromRow + Send + 'static,
         U: Send + 'a,
     {
-        BoxFuture(Box::pin(async move {
+        async move {
             self.run(conn)
                 .await?
                 .map_and_drop(|row| map(from_row(row)))
                 .await
-        }))
+        }
+        .boxed()
+    }
+
+    /// Returns a stream over the first result set.
+    ///
+    /// This method corresponds to [`QueryResult::stream_and_drop`][stream_and_drop].
+    ///
+    /// [stream_and_drop]: crate::QueryResult::stream_and_drop
+    fn stream<'a, 't: 'a, T, C>(
+        self,
+        conn: C,
+    ) -> BoxFuture<'a, ResultSetStream<'a, 'a, 't, T, Self::Protocol>>
+    where
+        Self: 'a,
+        Self::Protocol: Unpin,
+        T: Unpin + FromRow + Send + 'static,
+        C: ToConnection<'a, 't> + 'a,
+    {
+        async move {
+            self.run(conn)
+                .await?
+                .stream_and_drop()
+                .await
+                .transpose()
+                .expect("At least one result set is expected")
+        }
+        .boxed()
     }
 
     /// This method corresponds to [`Queryable::query_drop`][query_drop].
@@ -127,9 +153,7 @@ pub trait Query: Send + Sized {
         Self: 'a,
         C: ToConnection<'a, 't> + 'a,
     {
-        BoxFuture(Box::pin(async move {
-            self.run(conn).await?.drop_result().await
-        }))
+        async move { self.run(conn).await?.drop_result().await }.boxed()
     }
 }
 
@@ -141,14 +165,15 @@ impl<Q: AsRef<str> + Send + Sync> Query for Q {
         Self: 'a,
         C: ToConnection<'a, 't> + 'a,
     {
-        BoxFuture(Box::pin(async move {
+        async move {
             let mut conn = match conn.to_connection() {
                 ToConnectionResult::Immediate(conn) => conn,
                 ToConnectionResult::Mediate(fut) => fut.await?,
             };
             conn.raw_query(self).await?;
             Ok(QueryResult::new(conn))
-        }))
+        }
+        .boxed()
     }
 }
 
@@ -187,7 +212,7 @@ where
         Self: 'a,
         C: ToConnection<'a, 't> + 'a,
     {
-        BoxFuture(Box::pin(async move {
+        async move {
             let mut conn = match conn.to_connection() {
                 ToConnectionResult::Immediate(conn) => conn,
                 ToConnectionResult::Mediate(fut) => fut.await?,
@@ -199,7 +224,8 @@ where
                 .await?;
 
             Ok(QueryResult::new(conn))
-        }))
+        }
+        .boxed()
     }
 }
 
@@ -246,7 +272,7 @@ where
         Self: 'a,
         C: ToConnection<'a, 't> + 'a,
     {
-        BoxFuture(Box::pin(async move {
+        async move {
             let mut conn = match conn.to_connection() {
                 ToConnectionResult::Immediate(conn) => conn,
                 ToConnectionResult::Mediate(fut) => fut.await?,
@@ -259,7 +285,8 @@ where
             }
 
             Ok(())
-        }))
+        }
+        .boxed()
     }
 }
 

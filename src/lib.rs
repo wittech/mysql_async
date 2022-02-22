@@ -7,10 +7,10 @@
 // modified, or distributed except according to those terms.
 
 //! ## mysql-async
-//! Tokio based asynchronous MySql client library for rust programming language.
+//! Tokio based asynchronous MySql client library for The Rust Programming Language.
 //!
 //! ### Installation
-//! Library hosted on [crates.io](https://crates.io/crates/mysql_async/).
+//! The library is hosted on [crates.io](https://crates.io/crates/mysql_async/).
 //!
 //! ```toml
 //! [dependencies]
@@ -47,41 +47,34 @@
 //!     let pool = mysql_async::Pool::new(database_url);
 //!     let mut conn = pool.get_conn().await?;
 //!
-//!     // Create temporary table
-//!     conn.query_drop(
-//!         r"CREATE TEMPORARY TABLE payment (
-//!             customer_id int not null,
-//!             amount int not null,
-//!             account_name text
-//!         )"
-//!     ).await?;
+//!     // Create a temporary table
+//!     r"CREATE TEMPORARY TABLE payment (
+//!         customer_id int not null,
+//!         amount int not null,
+//!         account_name text
+//!     )".ignore(&mut conn).await?;
 //!
 //!     // Save payments
-//!     let params = payments.clone().into_iter().map(|payment| {
-//!         params! {
+//!     r"INSERT INTO payment (customer_id, amount, account_name)
+//!       VALUES (:customer_id, :amount, :account_name)"
+//!         .with(payments.iter().map(|payment| params! {
 //!             "customer_id" => payment.customer_id,
 //!             "amount" => payment.amount,
-//!             "account_name" => payment.account_name,
-//!         }
-//!     });
+//!             "account_name" => payment.account_name.as_ref(),
+//!         }))
+//!         .batch(&mut conn)
+//!         .await?;
 //!
-//!     conn.exec_batch(
-//!         r"INSERT INTO payment (customer_id, amount, account_name)
-//!           VALUES (:customer_id, :amount, :account_name)",
-//!         params,
-//!     ).await?;
-//!
-//!     // Load payments from database. Type inference will work here.
-//!     let loaded_payments = conn.exec_map(
-//!         "SELECT customer_id, amount, account_name FROM payment",
-//!         (),
-//!         |(customer_id, amount, account_name)| Payment { customer_id, amount, account_name },
-//!     ).await?;
+//!     // Load payments from the database. Type inference will work here.
+//!     let loaded_payments = "SELECT customer_id, amount, account_name FROM payment"
+//!         .with(())
+//!         .map(&mut conn, |(customer_id, amount, account_name)| Payment { customer_id, amount, account_name })
+//!         .await?;
 //!
 //!     // Dropped connection will go to the pool
-//!     conn;
+//!     drop(conn);
 //!
-//!     // Pool must be disconnected explicitly because
+//!     // The Pool must be disconnected explicitly because
 //!     // it's an asynchronous operation.
 //!     pool.disconnect().await?;
 //!
@@ -93,14 +86,16 @@
 //! ```
 
 #![recursion_limit = "1024"]
-#![cfg_attr(feature = "nightly", feature(test, const_fn))]
+#![cfg_attr(feature = "nightly", feature(test))]
 
 #[cfg(feature = "nightly")]
 extern crate test;
 
-pub use mysql_common::{chrono, constants as consts, params, time, uuid};
+pub use mysql_common::{constants as consts, params};
 
-use std::{future::Future, pin::Pin};
+use std::sync::Arc;
+
+mod buffer_pool;
 
 #[macro_use]
 mod macros;
@@ -114,33 +109,13 @@ mod opts;
 mod query;
 mod queryable;
 
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct BoxFuture<'a, T>(Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>);
+type BoxFuture<'a, T> = futures_core::future::BoxFuture<'a, Result<T>>;
 
-impl<T> Future for BoxFuture<'_, T> {
-    type Output = Result<T>;
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        self.0.as_mut().poll(cx)
-    }
-}
-
-impl<'a, T> std::fmt::Debug for BoxFuture<'a, T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("BoxFuture")
-            .field(&format!(
-                "dyn Future<Output = {}>",
-                std::any::type_name::<T>()
-            ))
-            .finish()
-    }
-}
+static BUFFER_POOL: once_cell::sync::Lazy<Arc<crate::buffer_pool::BufferPool>> =
+    once_cell::sync::Lazy::new(|| Default::default());
 
 #[doc(inline)]
-pub use self::conn::Conn;
+pub use self::conn::{binlog_stream::BinlogStream, Conn};
 
 #[doc(inline)]
 pub use self::conn::pool::Pool;
@@ -164,7 +139,22 @@ pub use self::opts::{
 pub use self::local_infile_handler::{builtin::WhiteListFsLocalInfileHandler, InfileHandlerFuture};
 
 #[doc(inline)]
-pub use mysql_common::packets::Column;
+pub use mysql_common::packets::{
+    binlog_request::BinlogRequest,
+    session_state_change::{
+        Gtids, Schema, SessionStateChange, SystemVariable, TransactionCharacteristics,
+        TransactionState, Unsupported,
+    },
+    BinlogDumpFlags, Column, Interval, OkPacket, SessionStateInfo, Sid,
+};
+
+pub mod binlog {
+    #[doc(inline)]
+    pub use mysql_common::binlog::consts::*;
+
+    #[doc(inline)]
+    pub use mysql_common::binlog::{events, jsonb, jsondiff, row, value};
+}
 
 #[doc(inline)]
 pub use mysql_common::proto::codec::Compression;
@@ -188,7 +178,7 @@ pub use mysql_common::value::convert::{from_value, from_value_opt, FromValueErro
 pub use mysql_common::value::json::{Deserialized, Serialized};
 
 #[doc(inline)]
-pub use self::queryable::query_result::QueryResult;
+pub use self::queryable::query_result::{result_set_stream::ResultSetStream, QueryResult};
 
 #[doc(inline)]
 pub use self::queryable::transaction::{Transaction, TxOpts};
@@ -239,9 +229,12 @@ pub mod prelude {
     impl<T: crate::queryable::stmt::StatementLike> StatementLike for T {}
 
     /// Everything that is a connection.
+    ///
+    /// Note that you could obtain a `'static` connection by giving away `Conn` or `Pool`.
     pub trait ToConnection<'a, 't: 'a>: crate::connection_like::ToConnection<'a, 't> {}
     // explicitly implemented because of rusdoc
     impl<'a> ToConnection<'a, 'static> for &'a crate::Pool {}
+    impl<'a> ToConnection<'static, 'static> for crate::Pool {}
     impl ToConnection<'static, 'static> for crate::Conn {}
     impl<'a> ToConnection<'a, 'static> for &'a mut crate::Conn {}
     impl<'a, 't> ToConnection<'a, 't> for &'a mut crate::Transaction<'t> {}
@@ -287,7 +280,7 @@ pub mod test_misc {
     }
 
     pub fn get_opts() -> OptsBuilder {
-        let mut builder = OptsBuilder::from_opts(&**DATABASE_URL);
+        let mut builder = OptsBuilder::from_opts(Opts::from_url(&**DATABASE_URL).unwrap());
         if test_ssl() {
             let ssl_opts = SslOpts::default()
                 .with_danger_skip_domain_validation(true)
