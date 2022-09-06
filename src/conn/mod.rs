@@ -44,7 +44,7 @@ use crate::{
         transaction::TxStatus,
         BinaryProtocol, Queryable, TextProtocol,
     },
-    BinlogStream, OptsBuilder,
+    BinlogStream, InfileData, OptsBuilder,
 };
 
 use self::routines::Routine;
@@ -111,6 +111,9 @@ struct ConnInner {
     auth_switched: bool,
     /// Connection is already disconnected.
     pub(crate) disconnected: bool,
+    /// One-time connection-level infile handler.
+    infile_handler:
+        Option<Pin<Box<dyn Future<Output = crate::Result<InfileData>> + Send + Sync + 'static>>>,
 }
 
 impl fmt::Debug for ConnInner {
@@ -151,6 +154,7 @@ impl ConnInner {
             auth_plugin: AuthPlugin::MysqlNativePassword,
             auth_switched: false,
             disconnected: false,
+            infile_handler: None,
         }
     }
 
@@ -372,6 +376,20 @@ impl Conn {
     /// Returns connection options.
     pub fn opts(&self) -> &Opts {
         &self.inner.opts
+    }
+
+    /// Setup _local_ `LOCAL INFILE` handler (see ["LOCAL INFILE Handlers"][2] section
+    /// of the crate-level docs).
+    ///
+    /// It'll overwrite existing _local_ handler, if any.
+    ///
+    /// [2]: ../mysql_async/#local-infile-handlers
+    pub fn set_infile_handler<T>(&mut self, handler: T)
+    where
+        T: Future<Output = crate::Result<InfileData>>,
+        T: Send + Sync + 'static,
+    {
+        self.inner.infile_handler = Some(Box::pin(handler));
     }
 
     fn take_stream(&mut self) -> Stream {
@@ -911,6 +929,7 @@ impl Conn {
         };
 
         self.inner.stmt_cache.clear();
+        self.inner.infile_handler = None;
         self.inner.pool = pool;
         Ok(())
     }
@@ -1012,8 +1031,6 @@ impl Conn {
     }
 
     pub async fn get_binlog_stream(mut self, request: BinlogRequest<'_>) -> Result<BinlogStream> {
-        // We'll disconnect this connection from a pool before requesting the binlog.
-        self.inner.pool = None;
         self.request_binlog(request).await?;
 
         Ok(BinlogStream::new(self))
@@ -1022,7 +1039,8 @@ impl Conn {
 
 #[cfg(test)]
 mod test {
-    use futures_util::stream::StreamExt;
+    use bytes::Bytes;
+    use futures_util::stream::{self, StreamExt};
     use mysql_common::binlog::events::EventData;
     use tokio::time::timeout;
 
@@ -1030,7 +1048,7 @@ mod test {
 
     use crate::{
         from_row, params, prelude::*, test_misc::get_opts, BinlogDumpFlags, BinlogRequest, Conn,
-        Error, OptsBuilder, Pool, WhiteListFsLocalInfileHandler,
+        Error, OptsBuilder, Pool, WhiteListFsHandler,
     };
 
     async fn gen_dummy_data() -> super::Result<()> {
@@ -1052,42 +1070,72 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn should_read_binlog() -> super::Result<()> {
-        async fn get_conn() -> super::Result<(Conn, Vec<u8>, u64)> {
-            let mut conn = Conn::new(get_opts()).await?;
+    async fn create_binlog_stream_conn(pool: Option<&Pool>) -> super::Result<(Conn, Vec<u8>, u64)> {
+        let mut conn = match pool {
+            None => Conn::new(get_opts()).await.unwrap(),
+            Some(pool) => pool.get_conn().await.unwrap(),
+        };
 
-            if let Ok(Some(gtid_mode)) = "SELECT @@GLOBAL.GTID_MODE"
-                .first::<String, _>(&mut conn)
-                .await
-            {
-                if !gtid_mode.starts_with("ON") {
-                    panic!(
-                        "GTID_MODE is disabled \
-                            (enable using --gtid_mode=ON --enforce_gtid_consistency=ON)"
-                    );
-                }
+        if let Ok(Some(gtid_mode)) = "SELECT @@GLOBAL.GTID_MODE"
+            .first::<String, _>(&mut conn)
+            .await
+        {
+            if !gtid_mode.starts_with("ON") {
+                panic!(
+                    "GTID_MODE is disabled \
+                        (enable using --gtid_mode=ON --enforce_gtid_consistency=ON)"
+                );
             }
-
-            let row: crate::Row = "SHOW BINARY LOGS".first(&mut conn).await?.unwrap();
-            let filename = row.get(0).unwrap();
-            let position = row.get(1).unwrap();
-
-            gen_dummy_data().await.unwrap();
-            Ok((conn, filename, position))
         }
 
+        let row: crate::Row = "SHOW BINARY LOGS".first(&mut conn).await.unwrap().unwrap();
+        let filename = row.get(0).unwrap();
+        let position = row.get(1).unwrap();
+
+        gen_dummy_data().await.unwrap();
+        Ok((conn, filename, position))
+    }
+
+    #[tokio::test]
+    async fn should_read_binlog() -> super::Result<()> {
+        read_binlog_streams_and_close_their_connections(None, (12, 13, 14))
+            .await
+            .unwrap();
+
+        let pool = Pool::new(get_opts());
+        read_binlog_streams_and_close_their_connections(Some(&pool), (15, 16, 17))
+            .await
+            .unwrap();
+
+        // Disconnecting the pool verifies that closing the binlog connections
+        // left the pool in a sane state.
+        timeout(Duration::from_secs(10), pool.disconnect())
+            .await
+            .unwrap()
+            .unwrap();
+
+        Ok(())
+    }
+
+    async fn read_binlog_streams_and_close_their_connections(
+        pool: Option<&Pool>,
+        binlog_server_ids: (u32, u32, u32),
+    ) -> super::Result<()> {
         // iterate using COM_BINLOG_DUMP
-        let (conn, filename, pos) = get_conn().await.unwrap();
+        let (conn, filename, pos) = create_binlog_stream_conn(pool).await.unwrap();
         let is_mariadb = conn.inner.is_mariadb;
 
         let mut binlog_stream = conn
-            .get_binlog_stream(BinlogRequest::new(12).with_filename(filename).with_pos(pos))
+            .get_binlog_stream(
+                BinlogRequest::new(binlog_server_ids.0)
+                    .with_filename(filename)
+                    .with_pos(pos),
+            )
             .await
             .unwrap();
 
         let mut events_num = 0;
-        while let Ok(Some(event)) = timeout(Duration::from_secs(1), binlog_stream.next()).await {
+        while let Ok(Some(event)) = timeout(Duration::from_secs(10), binlog_stream.next()).await {
             let event = event.unwrap();
             events_num += 1;
 
@@ -1106,14 +1154,18 @@ mod test {
             }
         }
         assert!(events_num > 0);
+        timeout(Duration::from_secs(10), binlog_stream.close())
+            .await
+            .unwrap()
+            .unwrap();
 
         if !is_mariadb {
             // iterate using COM_BINLOG_DUMP_GTID
-            let (conn, filename, pos) = get_conn().await.unwrap();
+            let (conn, filename, pos) = create_binlog_stream_conn(pool).await.unwrap();
 
             let mut binlog_stream = conn
                 .get_binlog_stream(
-                    BinlogRequest::new(13)
+                    BinlogRequest::new(binlog_server_ids.1)
                         .with_use_gtid(true)
                         .with_filename(filename)
                         .with_pos(pos),
@@ -1122,7 +1174,7 @@ mod test {
                 .unwrap();
 
             events_num = 0;
-            while let Ok(Some(event)) = timeout(Duration::from_secs(1), binlog_stream.next()).await
+            while let Ok(Some(event)) = timeout(Duration::from_secs(10), binlog_stream.next()).await
             {
                 let event = event.unwrap();
                 events_num += 1;
@@ -1142,14 +1194,18 @@ mod test {
                 }
             }
             assert!(events_num > 0);
+            timeout(Duration::from_secs(10), binlog_stream.close())
+                .await
+                .unwrap()
+                .unwrap();
         }
 
         // iterate using COM_BINLOG_DUMP with BINLOG_DUMP_NON_BLOCK flag
-        let (conn, filename, pos) = get_conn().await.unwrap();
+        let (conn, filename, pos) = create_binlog_stream_conn(pool).await.unwrap();
 
         let mut binlog_stream = conn
             .get_binlog_stream(
-                BinlogRequest::new(14)
+                BinlogRequest::new(binlog_server_ids.2)
                     .with_filename(filename)
                     .with_pos(pos)
                     .with_flags(BinlogDumpFlags::BINLOG_DUMP_NON_BLOCK),
@@ -1162,9 +1218,13 @@ mod test {
             let event = event.unwrap();
             events_num += 1;
             event.header().event_type().unwrap();
-            event.read_data()?;
+            event.read_data().unwrap();
         }
         assert!(events_num > 0);
+        timeout(Duration::from_secs(10), binlog_stream.close())
+            .await
+            .unwrap()
+            .unwrap();
 
         Ok(())
     }
@@ -1362,8 +1422,8 @@ mod test {
             .stmt_cache_ref()
             .iter()
             .map(|item| item.1.query.0.as_ref())
-            .collect::<Vec<&str>>();
-        assert_eq!(order, &["DO 6", "DO 5", "DO 3"]);
+            .collect::<Vec<&[u8]>>();
+        assert_eq!(order, &[b"DO 6", b"DO 5", b"DO 3"]);
         conn.disconnect().await?;
         Ok(())
     }
@@ -1676,8 +1736,7 @@ mod test {
 
         write(file_name, b"AAAAAA\nBBBBBB\nCCCCCC\n")?;
 
-        let opts = get_opts()
-            .local_infile_handler(Some(WhiteListFsLocalInfileHandler::new(&[file_name][..])));
+        let opts = get_opts().local_infile_handler(Some(WhiteListFsHandler::new(&[file_name][..])));
 
         // LOCAL INFILE in the middle of a multi-result set should not break anything.
         let mut conn = Conn::new(opts).await.unwrap();
@@ -1802,7 +1861,48 @@ mod test {
     }
 
     #[tokio::test]
-    async fn should_handle_local_infile() -> super::Result<()> {
+    async fn should_handle_local_infile_locally() -> super::Result<()> {
+        let mut conn = Conn::new(get_opts()).await.unwrap();
+        conn.query_drop("CREATE TEMPORARY TABLE tmp (a TEXT);")
+            .await
+            .unwrap();
+
+        conn.set_infile_handler(async move {
+            Ok(
+                stream::iter([Bytes::from("AAAAAA\n"), Bytes::from("BBBBBB\nCCCCCC\n")])
+                    .map(Ok)
+                    .boxed(),
+            )
+        });
+
+        match conn
+            .query_drop(r#"LOAD DATA LOCAL INFILE "dummy" INTO TABLE tmp;"#)
+            .await
+        {
+            Ok(_) => (),
+            Err(super::Error::Server(ref err)) if err.code == 1148 => {
+                // The used command is not allowed with this MySQL version
+                return Ok(());
+            }
+            Err(super::Error::Server(ref err)) if err.code == 3948 => {
+                // Loading local data is disabled;
+                // this must be enabled on both the client and server sides
+                return Ok(());
+            }
+            e @ Err(_) => e.unwrap(),
+        };
+
+        let result: Vec<String> = conn.query("SELECT * FROM tmp").await?;
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], "AAAAAA");
+        assert_eq!(result[1], "BBBBBB");
+        assert_eq!(result[2], "CCCCCC");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn should_handle_local_infile_globally() -> super::Result<()> {
         use std::fs::write;
 
         let file_path = tempfile::Builder::new().tempfile_in("").unwrap();
@@ -1811,8 +1911,7 @@ mod test {
 
         write(file_name, b"AAAAAA\nBBBBBB\nCCCCCC\n")?;
 
-        let opts = get_opts()
-            .local_infile_handler(Some(WhiteListFsLocalInfileHandler::new(&[file_name][..])));
+        let opts = get_opts().local_infile_handler(Some(WhiteListFsHandler::new(&[file_name][..])));
 
         let mut conn = Conn::new(opts).await.unwrap();
         conn.query_drop("CREATE TEMPORARY TABLE tmp (a TEXT);")

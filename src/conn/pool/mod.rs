@@ -162,15 +162,6 @@ impl Pool {
     /// **Note:** This Future won't resolve until all active connections, taken from it,
     /// are dropped or disonnected. Also all pending and new `GetConn`'s will resolve to error.
     pub fn disconnect(self) -> DisconnectPool {
-        let was_closed = self.inner.close.swap(true, atomic::Ordering::AcqRel);
-        if !was_closed {
-            // make sure we wake up the Recycler.
-            //
-            // note the lack of an .expect() here, because the Recycler may decide that there are
-            // no connections to wait for and exit quickly!
-            let _ = self.drop.send(None).is_ok();
-        }
-
         DisconnectPool::new(self)
     }
 
@@ -284,6 +275,8 @@ impl Pool {
 
 impl Drop for Conn {
     fn drop(&mut self) {
+        self.inner.infile_handler = None;
+
         if std::thread::panicking() {
             // Try to decrease the number of existing connections.
             if let Some(pool) = self.inner.pool.take() {
@@ -395,7 +388,7 @@ mod test {
 
             // now we'll kill connections..
             for id in ids {
-                master.query_drop(&format!("KILL {}", id)).await?;
+                master.query_drop(format!("KILL {}", id)).await?;
             }
 
             // now check, that they're still in the pool..
