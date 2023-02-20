@@ -10,13 +10,13 @@ use futures_util::FutureExt;
 pub use mysql_common::named_params;
 
 use mysql_common::{
-    constants::{DEFAULT_MAX_ALLOWED_PACKET, UTF8_GENERAL_CI},
+    constants::{DEFAULT_MAX_ALLOWED_PACKET, UTF8MB4_GENERAL_CI, UTF8_GENERAL_CI},
     crypto,
     io::ParseBuf,
     packets::{
         binlog_request::BinlogRequest, AuthPlugin, AuthSwitchRequest, CommonOkPacket, ErrPacket,
         HandshakePacket, HandshakeResponse, OkPacket, OkPacketDeserializer, OldAuthSwitchRequest,
-        ResultSetTerminator, SslRequest,
+        OldEofPacket, ResultSetTerminator, SslRequest,
     },
     proto::MySerialize,
 };
@@ -415,11 +415,15 @@ impl Conn {
 
     /// Returns true if io stream is encrypted.
     fn is_secure(&self) -> bool {
+        #[cfg(any(feature = "native-tls-tls", feature = "rustls-tls"))]
         if let Some(ref stream) = self.inner.stream {
             stream.is_secure()
         } else {
             false
         }
+
+        #[cfg(not(any(feature = "native-tls-tls", feature = "rustls-tls")))]
+        false
     }
 
     /// Hacky way to move connection through &mut. `self` becomes unusable.
@@ -490,10 +494,24 @@ impl Conn {
             .get_capabilities()
             .contains(CapabilityFlags::CLIENT_SSL)
         {
+            if !self
+                .inner
+                .capabilities
+                .contains(CapabilityFlags::CLIENT_SSL)
+            {
+                return Err(DriverError::NoClientSslFlagFromServer.into());
+            }
+
+            let collation = if self.inner.version >= (5, 5, 3) {
+                UTF8MB4_GENERAL_CI
+            } else {
+                UTF8_GENERAL_CI
+            };
+
             let ssl_request = SslRequest::new(
                 self.inner.capabilities,
                 DEFAULT_MAX_ALLOWED_PACKET as u32,
-                UTF8_GENERAL_CI as u8,
+                collation as u8,
             );
             self.write_struct(&ssl_request).await?;
             let conn = self;
@@ -679,9 +697,18 @@ impl Conn {
     /// Returns `true` for ProgressReport packet.
     fn handle_packet(&mut self, packet: &PooledBuf) -> Result<bool> {
         let ok_packet = if self.has_pending_result() {
-            ParseBuf(&*packet)
-                .parse::<OkPacketDeserializer<ResultSetTerminator>>(self.capabilities())
-                .map(|x| x.into_inner())
+            if self
+                .capabilities()
+                .contains(CapabilityFlags::CLIENT_DEPRECATE_EOF)
+            {
+                ParseBuf(&*packet)
+                    .parse::<OkPacketDeserializer<ResultSetTerminator>>(self.capabilities())
+                    .map(|x| x.into_inner())
+            } else {
+                ParseBuf(&*packet)
+                    .parse::<OkPacketDeserializer<OldEofPacket>>(self.capabilities())
+                    .map(|x| x.into_inner())
+            }
         } else {
             ParseBuf(&*packet)
                 .parse::<OkPacketDeserializer<CommonOkPacket>>(self.capabilities())
@@ -860,8 +887,8 @@ impl Conn {
     /// Do nothing if socket address is already in [`Opts`] or if `prefer_socket` is `false`.
     async fn read_socket(&mut self) -> Result<()> {
         if self.inner.opts.prefer_socket() && self.inner.socket.is_none() {
-            let row_opt = self.query_first("SELECT @@socket").await?;
-            self.inner.socket = row_opt.unwrap_or((None,)).0;
+            let row_opt = self.query_internal("SELECT @@socket").await?;
+            self.inner.socket = row_opt.unwrap_or(None);
         }
         Ok(())
     }
@@ -871,7 +898,7 @@ impl Conn {
         let max_allowed_packet = if let Some(value) = self.opts().max_allowed_packet() {
             Some(value)
         } else {
-            self.query_first("SELECT @@max_allowed_packet").await?
+            self.query_internal("SELECT @@max_allowed_packet").await?
         };
         if let Some(stream) = self.inner.stream.as_mut() {
             stream.set_max_allowed_packet(max_allowed_packet.unwrap_or(DEFAULT_MAX_ALLOWED_PACKET));
@@ -884,7 +911,7 @@ impl Conn {
         let wait_timeout = if let Some(value) = self.opts().wait_timeout() {
             Some(value)
         } else {
-            self.query_first("SELECT @@wait_timeout").await?
+            self.query_internal("SELECT @@wait_timeout").await?
         };
         self.inner.wait_timeout = Duration::from_secs(wait_timeout.unwrap_or(28800) as u64);
         Ok(())
@@ -1041,7 +1068,7 @@ impl Conn {
 mod test {
     use bytes::Bytes;
     use futures_util::stream::{self, StreamExt};
-    use mysql_common::binlog::events::EventData;
+    use mysql_common::{binlog::events::EventData, constants::MAX_PAYLOAD_LEN};
     use tokio::time::timeout;
 
     use std::time::Duration;
@@ -1430,15 +1457,15 @@ mod test {
 
     #[tokio::test]
     async fn should_perform_queries() -> super::Result<()> {
-        let long_string = ::std::iter::repeat('A')
-            .take(18 * 1024 * 1024)
-            .collect::<String>();
         let mut conn = Conn::new(get_opts()).await?;
-        let result: Vec<(String, u8)> = conn
-            .query(format!(r"SELECT '{}', 231", long_string))
-            .await?;
+        for x in (MAX_PAYLOAD_LEN - 2)..=(MAX_PAYLOAD_LEN + 2) {
+            let long_string = ::std::iter::repeat('A').take(x).collect::<String>();
+            let result: Vec<(String, u8)> = conn
+                .query(format!(r"SELECT '{}', 231", long_string))
+                .await?;
+            assert_eq!((long_string, 231_u8), result[0]);
+        }
         conn.disconnect().await?;
-        assert_eq!((long_string, 231_u8), result[0]);
         Ok(())
     }
 
