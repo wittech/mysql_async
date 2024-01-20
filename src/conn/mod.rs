@@ -896,16 +896,16 @@ impl Conn {
         let read_wait_timeout = self.opts().wait_timeout().is_none();
 
         let settings: Option<Row> = if read_socket || read_max_allowed_packet || read_wait_timeout {
-            self.query_internal("SELECT @@socket, @@max_allowed_packet, @@wait_timeout")
+            self.query_internal("SELECT @@max_allowed_packet, @@wait_timeout")
                 .await?
         } else {
             None
         };
 
-        // set socket inside the connection
-        if read_socket {
-            self.inner.socket = settings.as_ref().map(|s| s.get("@@socket")).unwrap_or(None);
-        }
+        // // set socket inside the connection
+        // if read_socket {
+        //     self.inner.socket = settings.as_ref().map(|s| s.get("@@socket")).unwrap_or(None);
+        // }
 
         // set max_allowed_packet
         let max_allowed_packet = if read_max_allowed_packet {
