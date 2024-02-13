@@ -50,10 +50,17 @@ use crate::{
 
 use self::routines::Routine;
 
+use regex::bytes::Regex;
+
 pub mod binlog_stream;
 pub mod pool;
 pub mod routines;
 pub mod stmt_cache;
+
+lazy_static::lazy_static! {
+    static ref FIXED_MARIADB_VERSION_RE: Regex =
+        Regex::new(r"^(?:5.5.5-)?(\d{1,2})\.(\d{1,2})\.(\d{1,3})-MariaDB").unwrap();
+}
 
 /// Helper that asynchronously disconnects the givent connection on the default tokio executor.
 fn disconnect(mut conn: Conn) {
@@ -469,14 +476,14 @@ impl Conn {
         };
 
         self.inner.capabilities = handshake.capabilities() & self.inner.opts.get_capabilities();
-        self.inner.version = handshake
-            .maria_db_server_version_parsed()
-            .map(|version| {
-                self.inner.is_mariadb = true;
-                version
-            })
-            .or_else(|| handshake.server_version_parsed())
-            .unwrap_or((0, 0, 0));
+        self.inner.version =
+            Self::fixed_maria_db_server_version_parsed(handshake.server_version_ref())
+                .map(|version| {
+                    self.inner.is_mariadb = true;
+                    version
+                })
+                .or_else(|| handshake.server_version_parsed())
+                .unwrap_or((0, 0, 0));
         self.inner.id = handshake.connection_id();
         self.inner.status = handshake.status_flags();
         self.inner.auth_plugin = match handshake.auth_plugin() {
@@ -491,6 +498,20 @@ impl Conn {
             None => AuthPlugin::MysqlNativePassword,
         };
         Ok(())
+    }
+
+    /// Parsed mariadb server version.
+    /// Fixed version of `Handshake::maria_db_server_version_parsed` (only present on Prisma's fork).
+    /// See https://github.com/blackbeam/rust_mysql_common/issues/124 for more info.
+    pub fn fixed_maria_db_server_version_parsed(version: &[u8]) -> Option<(u16, u16, u16)> {
+        FIXED_MARIADB_VERSION_RE.captures(version).map(|captures| {
+            // Should not panic because validated with regex
+            (
+                lexical::parse::<u16, _>(captures.get(1).unwrap().as_bytes()).unwrap(),
+                lexical::parse::<u16, _>(captures.get(2).unwrap().as_bytes()).unwrap(),
+                lexical::parse::<u16, _>(captures.get(3).unwrap().as_bytes()).unwrap(),
+            )
+        })
     }
 
     async fn switch_to_ssl_if_needed(&mut self) -> Result<()> {
